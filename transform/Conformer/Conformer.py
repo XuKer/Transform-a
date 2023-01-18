@@ -206,14 +206,171 @@ class Med_ConvBlock(nn.Module):
 
         return  x
 class ConvTransBlock(nn.Module):
+    def  __init__(self,inplanes,outplanes,res_conv,stride,dw_stride,embed_dim,num_heads=12,mlp_ratio=4.,
+                  qkv_bias=False,qk_scale=None,drop_rate=0.,attn_drop_rate=0.,drop_path_rate=0.,
+                  last_fusion=False,num_med_block=0,groups=1):
+        super(ConvTransBlock, self).__init__()
+        expansion=4
+        self.cnn_block=ConvBlock(inplanes=inplanes,outplanes=outplanes,res_conv=res_conv,stride=stride,
+                                 groups=groups)
+
+        if last_fusion:
+            self.fusion_block=ConvBlock(inplanes=inplanes,outplanes=outplanes,stride=2,res_conv=True,groups=groups)
+        else:
+            self.fusion_block=ConvBlock(inplanes=outplanes,outplanes=outplanes,groups=groups)
+        if num_med_block>0:
+            self.med_block=[]
+            for i in range(num_med_block):
+                self.med_block.append(Med_ConvBlock(inplanes=outplanes,groups=groups))
+                self.med_block=nn.ModuleList(self.med_block)
+        self.squeeze_block=FCUDown(inplanes=outplanes//expansion,outplanes=embed_dim,dw_stride=dw_stride)
+
+        self.expand_block=FCUUP(inplanes=embed_dim,outplanes=outplanes//expansion,up_straide=dw_stride)
+
+        self.trans_block=Block(dim=embed_dim,num_heads=num_heads,mlp_ratio=mlp_ratio,
+                               qkv_bias=qkv_bias,qk_scale=qk_scale,drop=drop_rate,attn_drop=attn_drop_rate,
+                               drop_path=drop_path_rate)
+
+        self.dw_stride=dw_stride
+        self.embed_dim=embed_dim
+        self.num_med_block=num_med_block
+        self.last_fusion=last_fusion
+    def  forward(self,x,x_t):
+        x,x2=self.cnn_block(x)
+        _,_,H,W=x2.shape
+
+        x_st=self.squeeze_block(x2,x_t)
+
+        x_t=self.trans_block(x_st,x_t)
+
+        if self.num_med_block>0:
+            for m in self.med_block:
+                x=m(x)
+        x_t_r=self.expand_block(x_t,H//self.dw_stride,W//self.dw_stride)
+        x=self.fusion_block(x,x_t_r,return_x_2=False)
+
+        return  x,x_t
+
+class Conformer(nn.Module):
+
+    def __init__(self,patch_size=16,in_chans=3,num_classes=1000,base_channel=64,channnel_ratio=4,
+                 num_med_block=0,embed_dim=768,depth=12,num_heads=12,mlp_ratio=4.,qkv_bias=False,
+                 qk_scale=None,drop_rate=0.,attn_drop_rate=0.,drop_path_rate=0.):
+        super().__init__()
+
+        self.num_classes=num_classes
+        self.num_features=self.embed_dim=embed_dim
+        assert depth % 3 == 0
+
+        self.cls_token=nn.Parameter(torch.zeros(1,1,embed_dim))
+        self.trans_dpr=[x.item() for x in torch.linspace(0,drop_path_rate,depth)]
+
+
+        self.trans_norm=nn.LayerNorm(embed_dim)
+        self.trans_cls_head=nn.Linear(embed_dim,num_classes) if num_classes >0 else nn.Identity()
+        self.pooling=nn.AdaptiveAvgPool2d(1)
+        self.conv_cls_head=nn.Linear(int(256* channnel_ratio),num_classes)
+
+
+        self.conv1=nn.Conv2d(in_chans,64,kernel_size=7,stride=2,padding=3,bias=False)
+        self.bn1=nn.BatchNorm2d(64)
+        self.act1=nn.ReLU(inplace=True)
+        self.maxpool=nn.MaxPool2d(kernel_size=3,stride=2,padding=1)
+
+
+        stage_1_channel=int(base_channel* channnel_ratio)
+        trans_dw_stride=patch_size//4
+        self.conv1=ConvBlock(inplanes=64,outplanes=stage_1_channel,res_conv=True,stride=1)
+        self.trans_patch_conv=nn.Conv2d(64,embed_dim,kernel_size=trans_dw_stride,stride=trans_dw_stride,padding=0)
+        self.trans_1=Block(dim=embed_dim,num_heads=num_heads,mlp_ratio=mlp_ratio,qkv_bias=qkv_bias,
+                           qk_scale=qk_scale,drop=drop_rate,attn_drop=attn_drop_rate,drop_path=self.trans_dpr[0])
 
 
 
+        init_stage=2
+        fin_stage=depth//3+1
+        for i in range(init_stage,fin_stage):
+            self.add_module('conv_trans_'+str(i),ConvTransBlock(
+                stage_1_channel,stage_1_channel,False,1,dw_stride=trans_dw_stride,embed_dim=embed_dim,
+                num_heads=num_heads,mlp_ratio=mlp_ratio,qkv_bias=qkv_bias,qk_scale=qk_scale,drop_rate=drop_rate,
+                attn_drop_rate=attn_drop_rate,drop_path_rate=self.trans_dpr[i-1],num_med_block=num_med_block
+            ))
+        stage_2_channel=int(base_channel*channnel_ratio*2)
 
 
+        init_stage=fin_stage
+        fin_stage=fin_stage+depth//3
+        for i in range(init_stage,fin_stage):
+            s=2 if i == init_stage else 1
+            in_channel=stage_1_channel if i==init_stage else stage_2_channel
+            res_conv=True if i ==init_stage else False
+            self.add_module('conv_trans_'+str(i),ConvTransBlock(
+                in_channel,stage_2_channel,res_conv,s,dw_stride=trans_dw_stride//2,embed_dim=embed_dim,num_heads=num_heads,mlp_ratio=mlp_ratio,
+                qkv_bias=qkv_bias,qk_scale=qk_scale,drop_rate=drop_rate,attn_drop_rate=attn_drop_rate,drop_path_rate=self.trans_dpr[i-1],
+                num_med_block=num_med_block
+            ))
 
+        stage_3_channel=int(base_channel*channnel_ratio*2*2)
 
+        init_stage=fin_stage
+        fin_stage=fin_stage+depth//3
+        for i in range(init_stage,fin_stage):
+            s=2 if i== init_stage else 1
+            in_channel=stage_2_channel if i==init_stage else stage_3_channel
+            res_conv =True if i ==init_stage else False
+            last_fusion =True if i==depth else False
+            self.add_module('conv_trans_'+str(i),ConvTransBlock(
+                in_channel,stage_3_channel,res_conv,s,dw_stride=trans_dw_stride//4,embed_dim=embed_dim,
+                num_heads=num_heads,mlp_ratio=mlp_ratio,qkv_bias=qkv_bias,qk_scale=qk_scale,drop_rate=drop_rate,
+                attn_drop_rate=attn_drop_rate,drop_path_rate=self.trans_dpr[i-1],num_med_block=num_med_block,last_fusion=last_fusion
+            ))
+        self.fin_stage=fin_stage
 
+        trunc_normal_(self.cls_token,std=.02)
+
+        self.apply(self._init_weight)
+    def _init_weight(self,m):
+        if isinstance(m,nn.Linear):
+            trunc_normal_(m.weight,std=.02)
+            if isinstance(m,nn.Linear) and m.bias is not None:
+                nn.init.constant_(m.bias,0)
+        elif isinstance(m,nn.LayerNorm):
+            nn.init.constant_(m.bias,0)
+            nn.init.constant_(m.weight,1.0)
+        elif isinstance(m,nn.Conv2d):
+            nn.init.kaiming_normal_(m.weight,mode='fan_out',nonlinearity='relu')
+        elif isinstance(m,nn.BatchNorm2d):
+            nn.init.constant_(m.weight,1.)
+            nn.init.constant_(m.bias,0.)
+        elif isinstance(m,nn.GroupNorm):
+            nn.init.constant_(m.weight,1.)
+            nn.init.constant_(m.bias,0.)
+    @torch.jit.ignore
+    def no_weight_decay(self):
+        return {'cls_token'}
+
+    def forward(self,x):
+        B=x.shape[0]
+        cls_token=self.cls_token.expand(B,-1,-1)
+
+        x_base=self.maxpool(self.act1(self.bn1(self.conv1(x))))
+
+        x=self.conv1(x_base,return_x_2=False)
+
+        x_t=self.trans_patch_conv(x_base).flatten(2).transpose(1,2)
+        x_t=torch.cat([cls_token,x_t],dim=1)
+        x_t=self.trans_1(x_t)
+
+        for i in range(2,self.fin_stage):
+            x,x_t=eval('self.conv_trans_'+str(i))(x,x_t)
+
+            x_p=self.pooling(x).flatten(1)
+            conv_cls=self.conv_cls_head(x_p)
+
+            x_t=self.trans_norm(x_t)
+            tran_cls=self.trans_cls_head(x_t[:,0])
+
+            return [conv_cls,tran_cls]
 
 
 
